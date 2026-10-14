@@ -1,4 +1,27 @@
 import os
+from threading import Thread
+from flask import Flask
+import discord
+from discord.ext import commands
+import yt_dlp
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot Online"
+
+def run():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+keep_alive()
+
+import os
 import discord
 from discord.ext import commands
 import yt_dlp
