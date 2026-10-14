@@ -21,11 +21,6 @@ def keep_alive():
 
 keep_alive()
 
-import os
-import discord
-from discord.ext import commands
-import yt_dlp
-
 # Configurar intents para leer los mensajes
 intents = discord.Intents.default()
 intents.message_content = True
@@ -34,19 +29,19 @@ bot = commands.Bot(command_prefix='.', intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f'¡Bot conectado con éxito como {bot.YumiVideos}!')
+    print(f'¡Bot conectado con éxito como {bot.user}!')
 
 @bot.command(name='bl')
 async def descargar_video(ctx, url: str):
     """Comando .bl <enlace> para descargar el video y subirlo al chat."""
-    await ctx.send("⏳ ya estoy descargado el vide... no te preocupes...")
+    await ctx.send("⏳ ya estoy descargado el video... no te preocupes...")
 
-    # Opciones de yt-dlp para capturar el video en MP4
+    # Opciones de yt-dlp optimizadas para calidad baja (360p)
     ydl_opts = {
-    'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]',
-    'outtmpl': '%(id)s.%(ext)s',
-    'max_filesize': 8 * 1024 * 1024,
-}
+        'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best[height<=360]',
+        'outtmpl': '%(id)s.%(ext)s',
+        'noplaylist': True,
+    }
 
     filename = None
     try:
@@ -61,7 +56,7 @@ async def descargar_video(ctx, url: str):
         if filename and os.path.exists(filename):
             file_size = os.path.getsize(filename)
             
-            # Comprobar el límite del servidor de Discord
+            # Comprobar el límite del servidor de Discord (8 MB en servidores gratis)
             if file_size > ctx.guild.filesize_limit:
                 await ctx.send("❌ el video es muy pesado, no creo poder subirlo.")
             else:
