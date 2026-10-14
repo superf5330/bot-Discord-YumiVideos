@@ -43,12 +43,9 @@ async def descargar_video(ctx, url: str):
 
     # Opciones de yt-dlp para capturar el video en MP4
     ydl_opts = {
-    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+    'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]',
     'outtmpl': '%(id)s.%(ext)s',
-    'postprocessors': [{
-        'key': 'FFmpegVideoConvertor',
-        'preferedformat': 'mp4',
-    }],
+    'max_filesize': 8 * 1024 * 1024,
 }
 
     filename = None
