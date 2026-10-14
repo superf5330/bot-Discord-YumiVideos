@@ -65,28 +65,35 @@ async def on_message(message):
             break
 
     if categoria_detectada:
-        if categoria_detectada not in keyword_data:
-            keyword_data[categoria_detectada] = {'count': 0, 'last_time': 0}
+        # Validar si es multimedia (fotos, videos, archivos adjuntos o embeds) para la categoría de fotos rarunas
+        es_multimedia = bool(message.attachments or message.embeds)
 
-        data = keyword_data[categoria_detectada]
-
-        # Si pasaron más de 30 segundos desde la última vez que se mencionó, reiniciamos el contador a 1
-        if (current_time - data['last_time']) > 30:
-            data['count'] = 1
+        # Si es categoría de contenido adulto/follar pero NO tiene foto/video/embed, lo ignoramos (es texto común)
+        if categoria_detectada in ["adulto", "follar"] and not es_multimedia:
+            pass
         else:
-            data['count'] += 1
+            if categoria_detectada not in keyword_data:
+                keyword_data[categoria_detectada] = {'count': 0, 'last_time': 0}
 
-        data['last_time'] = current_time
+            data = keyword_data[categoria_detectada]
 
-        # ¿Llegó a 5 menciones rápidas O pasaron más de 30 minutos (1800s) desde la última vez que habló el bot?
-        if data['count'] >= 5 or (current_time - last_bot_spoke) >= 1800:
-            last_bot_spoke = current_time
-            data['count'] = 0  # Reiniciar contador
-
-            if categoria_detectada in ["adulto", "follar"]:
-                await message.reply("otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅")
+            # Si pasaron más de 30 segundos desde la última vez que se mencionó, reiniciamos el contador a 1
+            if (current_time - data['last_time']) > 30:
+                data['count'] = 1
             else:
-                await message.reply("emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨")
+                data['count'] += 1
+
+            data['last_time'] = current_time
+
+            # ¿Llegó a 5 menciones rápidas O pasaron más de 30 minutos (1800s) desde la última vez que habló el bot?
+            if data['count'] >= 5 or (current_time - last_bot_spoke) >= 1800:
+                last_bot_spoke = current_time
+                data['count'] = 0  # Reiniciar contador
+
+                if categoria_detectada in ["adulto", "follar"]:
+                    await message.reply("otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅")
+                else:
+                    await message.reply("emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨")
 
     # 2. Detección de enlaces, fotos o archivos con reacciones (más de 3 emojis)
     if message.embeds or message.attachments or "http" in content:
