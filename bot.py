@@ -29,16 +29,18 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix='.', intents=intents)
 
-# Control de spam y memoria temporal
-keyword_counts = {}
+# Control de spam inteligente: almacena {'count': int, 'last_time': float}
+keyword_data = {}
 last_bot_spoke = 0
 
-# Lista ampliada de palabras clave "incómodas" o raras
-TRIGGER_WORDS = [
-    "porno", "sexo", "drogas", "hentai", "furros", "femboys", 
-    "nudes", "pack", "nsfw", "rule34", "paja", "coger", 
-    "follar", "marihuana", "perico", "tusi", "pene", "vagina"
-]
+# Raíces y palabras clave con sus conjugaciones comunes
+TRIGGER_WORDS = {
+    "adulto": ["porno", "sexo", "hentai", "nudes", "pack", "nsfw", "rule34", "paja", "pajas", "pajero"],
+    "raro": ["furros", "femboys", "pene", "vagina"],
+    "follar": ["follar", "follarte", "follare", "follan", "follaron", "follaste", "follando"],
+    "coger": ["coger", "coges", "cogen", "cogieron", "cogiendo", "cojas"],
+    "drogas": ["drogas", "marihuana", "perico", "tusi", "poro", "weed"]
+}
 
 @bot.event
 async def on_ready():
@@ -55,43 +57,51 @@ async def on_message(message):
     current_time = time.time()
     content = message.content.lower()
 
-    # 1. Detección de palabras clave con control anti-spam (5 menciones o 30 minutos sin hablar)
-    palabra_detectada = None
-    for word in TRIGGER_WORDS:
-        if word in content:
-            palabra_detectada = word
+    # 1. Detección de palabras clave y conjugaciones
+    categoria_detectada = None
+    for categoria, palabras in TRIGGER_WORDS.items():
+        if any(palabra in content for palabra in palabras):
+            categoria_detectada = categoria
             break
 
-    if palabra_detectada:
-        if palabra_detectada not in keyword_counts:
-            keyword_counts[palabra_detectada] = 0
-        
-        keyword_counts[palabra_detectada] += 1
+    if categoria_detectada:
+        if categoria_detectada not in keyword_data:
+            keyword_data[categoria_detectada] = {'count': 0, 'last_time': 0}
 
-        # ¿Llegó a 5 menciones o pasaron 30 minutos (1800 segundos) desde la última vez?
-        if keyword_counts[palabra_detectada] >= 5 or (current_time - last_bot_spoke) >= 1800:
+        data = keyword_data[categoria_detectada]
+
+        # Si pasaron más de 30 segundos desde la última vez que se mencionó, reiniciamos el contador a 1
+        if (current_time - data['last_time']) > 30:
+            data['count'] = 1
+        else:
+            data['count'] += 1
+
+        data['last_time'] = current_time
+
+        # ¿Llegó a 5 menciones rápidas O pasaron más de 30 minutos (1800s) desde la última vez que habló el bot?
+        if data['count'] >= 5 or (current_time - last_bot_spoke) >= 1800:
             last_bot_spoke = current_time
-            keyword_counts[palabra_detectada] = 0  # Reiniciar contador
+            data['count'] = 0  # Reiniciar contador
 
-            if palabra_detectada in ["porno", "sexo", "hentai", "nudes", "pack", "nsfw", "rule34", "paja"]:
-                await message.channel.send("otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?")
+            if categoria_detectada in ["adulto", "follar"]:
+                await message.reply("otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅")
             else:
-                await message.channel.send("emmm… ¿okey? ¿de qué están hablando?")
+                await message.reply("emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨")
 
-    # 2. Detección de enlaces o archivos multimedia con muchas reacciones (más de 3 emojis)
+    # 2. Detección de enlaces, fotos o archivos con reacciones (más de 3 emojis)
     if message.embeds or message.attachments or "http" in content:
         total_reactions = sum(reaction.count for reaction in message.reactions)
         if total_reactions >= 3 and (current_time - last_bot_spoke) >= 1800:
             last_bot_spoke = current_time
-            await message.channel.send("¿qué tendrá ese link o archivo para tantas reacciones?")
+            await message.reply("¿qué tendrá ese link o archivo para tantas reacciones?... 😅😅😅")
 
-    # IMPORTANTE: Permitir que funcionen los comandos del bot (como .bl)
+    # IMPORTANTE: Procesar los comandos normales (como .bl)
     await bot.process_commands(message)
 
 @bot.command(name='bl')
 async def descargar_video(ctx, url: str):
     """Comando .bl <enlace> para descargar el video y subirlo al chat."""
-    await ctx.send("⏳ ya estoy descargando el video... no te preocupes...")
+    await ctx.reply("⏳ ya estoy descargando el video... no te preocupes...❤️❤️❤️")
 
     ydl_opts = {
         'format': 'best[height<=360]/best',
@@ -112,16 +122,16 @@ async def descargar_video(ctx, url: str):
             file_size = os.path.getsize(filename)
             
             if file_size > ctx.guild.filesize_limit:
-                await ctx.send("❌ el video es muy pesado, no creo poder subirlo.")
+                await ctx.reply("❌ el video es muy pesado, no creo poder subirlo. lo siento.")
             else:
-                await ctx.send(file=discord.File(filename))
+                await ctx.reply(file=discord.File(filename))
             
             os.remove(filename)
         else:
-            await ctx.send("❌ No pude procesar el enlace... no se porque!!!.")
+            await ctx.reply("❌ No pude procesar el enlace... no se porque!!!.")
 
     except Exception as e:
-        await ctx.send(f"⚠️ algo malo paso al procesar el link...: `{str(e)}`")
+        await ctx.reply(f"⚠️ algo malo paso al procesar el link, no se ques cariño!!!...: `{str(e)}`")
         if filename and os.path.exists(filename):
             os.remove(filename)
 
