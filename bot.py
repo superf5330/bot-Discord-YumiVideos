@@ -43,11 +43,13 @@ async def descargar_video(ctx, url: str):
 
     # Opciones de yt-dlp para capturar el video en MP4
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'max_filesize': 50 * 1024 * 1024, # Límite de 50MB para Discord
-        'noplaylist': True,
-    }
+    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+    'outtmpl': '%(id)s.%(ext)s',
+    'postprocessors': [{
+        'key': 'FFmpegVideoConvertor',
+        'preferedformat': 'mp4',
+    }],
+}
 
     filename = None
     try:
