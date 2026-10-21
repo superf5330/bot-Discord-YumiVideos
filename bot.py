@@ -1,145 +1,394 @@
+import asyncio
 import os
+import random
+import re
+import shutil
+import tempfile
 import time
+import unicodedata
 from threading import Thread
-from flask import Flask
-import discord
-from discord.ext import commands
-import yt_dlp
 
+import aiohttp
+import discord
+import imageio_ffmpeg
+import yt_dlp
+from discord.ext import commands
+from flask import Flask
+
+# ───────────────────────── Servidor web (para Render) ─────────────────────────
 app = Flask('')
 
+
 @app.route('/')
+@app.route('/health')
 def home():
     return "Bot Online"
 
-def run():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    port = int(os.environ.get("PORT", 8080))
+    Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
 
-keep_alive()
 
-# Configurar intents para leer los mensajes, contenido y reacciones
-intents = discord.Intents.default()
-intents.message_content = True
-intents.reactions = True
+# ───────────────────────────── Configuración ──────────────────────────────────
+PREFIX = '.'
+FFMPEG = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
+DOWNLOAD_DIR = 'downloads'
 
-bot = commands.Bot(command_prefix='.', intents=intents)
+MAX_DURATION = int(os.environ.get('MAX_DURATION', 600))   # segundos (10 min por defecto)
+AUDIO_KBPS = 64
+SAFETY = 0.93                                             # margen para no pasarse del límite
 
-# Control de spam inteligente: almacena {'count': int, 'last_time': float}
-keyword_data = {}
-last_bot_spoke = 0
+MENCIONES_NECESARIAS = 5
+RESET_SECONDS = 1800          # 30 min sin menciones de la categoría = contador a 0
+REACTION_THRESHOLD = 3        # reacciones para que el bot comente
+REACTION_COOLDOWN = 1800      # 30 min entre comentarios de reacciones por canal
 
-# Raíces y palabras clave con sus conjugaciones comunes
+# IA opcional (Gemini gratis). Si no hay GEMINI_API_KEY se usan frases fijas.
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
+
+PERSONALIDAD = (
+    "Eres un bot de Discord con personalidad juguetona, cariñosa y un poquito sarcástica. "
+    "Hablas en español casual, con 1 o 2 frases cortas y un par de emojis. "
+    "Nunca das sermones ni regaños; te haces el curioso o el chistoso. "
+    "No repitas tu frase de siempre, varía."
+)
+
 TRIGGER_WORDS = {
     "adulto": ["porno", "sexo", "hentai", "nudes", "pack", "nsfw", "rule34", "paja", "pajas", "pajero"],
     "raro": ["furros", "femboys", "pene", "vagina"],
     "follar": ["follar", "follarte", "follare", "follan", "follaron", "follaste", "follando"],
     "coger": ["coger", "coges", "cogen", "cogieron", "cogiendo", "cojas"],
-    "drogas": ["drogas", "marihuana", "perico", "tusi", "poro", "weed"]
+    "drogas": ["drogas", "marihuana", "perico", "tusi", "poro", "weed"],
 }
+# Categorías que solo cuentan si el mensaje trae foto/video/link
+SOLO_CON_MEDIA = {"adulto", "follar"}
+
+FALLBACKS = {
+    "media": ["otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅",
+              "chicos… ¿otra vez con eso?... 😅😅😅"],
+    "texto": ["emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨",
+              "hmmm… ¿y esa conversación tan interesante?... 🤨🤨🤨"],
+    "reaccion": ["¿qué tendrá ese link o archivo para tantas reacciones?... 😅😅😅",
+                 "uy… ¿qué hay ahí que todos reaccionan?... 👀"],
+}
+
+
+# ───────────────────────────── Utilidades ─────────────────────────────────────
+def normalizar(texto: str) -> str:
+    texto = unicodedata.normalize('NFD', texto.lower())
+    return ''.join(c for c in texto if unicodedata.category(c) != 'Mn')
+
+
+URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+
+# Palabra completa: "coger" NO se activa con "escoger" ni "pene" con "Penélope"
+PATTERNS = {
+    cat: re.compile(r'\b(?:' + '|'.join(re.escape(normalizar(p)) for p in words) + r')\b')
+    for cat, words in TRIGGER_WORDS.items()
+}
+
+
+def detectar_categoria(contenido: str):
+    limpio = normalizar(URL_RE.sub(' ', contenido))  # ignora palabras dentro de URLs
+    for cat, patron in PATTERNS.items():
+        if patron.search(limpio):
+            return cat
+    return None
+
+
+_session = None
+
+
+async def get_session():
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+    return _session
+
+
+async def respuesta_ia(situacion: str, fallback_key: str) -> str:
+    """Genera una frase con Gemini; si falla o no hay clave, usa una frase fija."""
+    fallback = random.choice(FALLBACKS[fallback_key])
+    if not GEMINI_API_KEY:
+        return fallback
+    try:
+        session = await get_session()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        body = {
+            "systemInstruction": {"parts": [{"text": PERSONALIDAD}]},
+            "contents": [{"role": "user", "parts": [{"text": situacion}]}],
+            "generationConfig": {"maxOutputTokens": 120, "temperature": 1.0},
+        }
+        async with session.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}) as r:
+            if r.status != 200:
+                return fallback
+            data = await r.json()
+        texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return texto[:400] or fallback
+    except Exception:
+        return fallback
+
+
+# ───────────────────────────── Bot ────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+keyword_data = {}        # {categoria: {'count': int, 'last_time': float}}
+reaction_counts = {}     # {message_id: {'n': int, 't': float, 'done': bool}}
+last_reaction_spoke = {}  # {channel_id: float}
+last_chat = {}           # {user_id: float}  (anti-spam de la charla con IA)
+descargas = asyncio.Semaphore(1)  # una descarga a la vez (Render gratis tiene poca RAM)
+
 
 @bot.event
 async def on_ready():
-    print(f'¡Bot conectado con éxito como {bot.user}!')
+    print(f'¡Bot conectado con éxito como {bot.user}! IA: {"sí" if GEMINI_API_KEY else "no"}')
+
 
 @bot.event
-async def on_message(message):
-    global last_bot_spoke
-    
-    # Evitar que el bot se responda a sí mismo
-    if message.author == bot.user:
+async def on_message(message: discord.Message):
+    if message.author.bot:  # ignora a otros bots y a sí mismo (evita loops)
         return
 
-    current_time = time.time()
-    content = message.content.lower()
+    now = time.time()
 
-    # 1. Detección de palabras clave y conjugaciones
-    categoria_detectada = None
-    for categoria, palabras in TRIGGER_WORDS.items():
-        if any(palabra in content for palabra in palabras):
-            categoria_detectada = categoria
-            break
+    # 1. Palabras clave con contador por categoría
+    cat = detectar_categoria(message.content)
+    if cat:
+        tiene_media = bool(message.attachments or message.embeds or URL_RE.search(message.content))
+        if cat not in SOLO_CON_MEDIA or tiene_media:
+            data = keyword_data.setdefault(cat, {'count': 0, 'last_time': 0})
 
-    if categoria_detectada:
-        # Validar si es multimedia (fotos, videos, archivos adjuntos o embeds) para la categoría de fotos rarunas
-        es_multimedia = bool(message.attachments or message.embeds)
+            if now - data['last_time'] > RESET_SECONDS:  # la charla murió: empezar de cero
+                data['count'] = 0
+            data['count'] += 1
+            data['last_time'] = now
 
-        # Si es categoría de contenido adulto/follar pero NO tiene foto/video/embed, lo ignoramos (es texto común)
-        if categoria_detectada in ["adulto", "follar"] and not es_multimedia:
-            pass
-        else:
-            if categoria_detectada not in keyword_data:
-                keyword_data[categoria_detectada] = {'count': 0, 'last_time': 0}
+            if data['count'] >= MENCIONES_NECESARIAS:
+                data['count'] = 0
+                clave = "media" if cat in SOLO_CON_MEDIA else "texto"
+                situacion = (f"En el chat llevan {MENCIONES_NECESARIAS} mensajes seguidos hablando de "
+                             f"'{cat}'. Comenta algo corto y gracioso sobre eso.")
+                await message.reply(await respuesta_ia(situacion, clave), mention_author=False)
 
-            data = keyword_data[categoria_detectada]
+    # 2. Charla con IA si mencionan al bot (solo si hay API key)
+    elif GEMINI_API_KEY and bot.user in message.mentions and not message.content.startswith(PREFIX):
+        if now - last_chat.get(message.author.id, 0) > 8:
+            last_chat[message.author.id] = now
+            texto = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+            async with message.channel.typing():
+                resp = await respuesta_ia(f"Un usuario te dijo: {texto or '(te mencionó sin decir nada)'}", "texto")
+            await message.reply(resp, mention_author=False)
 
-            # Si pasaron más de 30 segundos desde la última vez que se mencionó, reiniciamos el contador a 1
-            if (current_time - data['last_time']) > 30:
-                data['count'] = 1
-            else:
-                data['count'] += 1
-
-            data['last_time'] = current_time
-
-            # ¿Llegó a 5 menciones rápidas O pasaron más de 30 minutos (1800s) desde la última vez que habló el bot?
-            if data['count'] >= 5 or (current_time - last_bot_spoke) >= 1800:
-                last_bot_spoke = current_time
-                data['count'] = 0  # Reiniciar contador
-
-                if categoria_detectada in ["adulto", "follar"]:
-                    await message.reply("otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅")
-                else:
-                    await message.reply("emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨")
-
-    # 2. Detección de enlaces, fotos o archivos con reacciones (más de 3 emojis)
-    if message.embeds or message.attachments or "http" in content:
-        total_reactions = sum(reaction.count for reaction in message.reactions)
-        if total_reactions >= 3 and (current_time - last_bot_spoke) >= 1800:
-            last_bot_spoke = current_time
-            await message.reply("¿qué tendrá ese link o archivo para tantas reacciones?... 😅😅😅")
-
-    # IMPORTANTE: Procesar los comandos normales (como .bl)
     await bot.process_commands(message)
 
-@bot.command(name='bl')
-async def descargar_video(ctx, url: str):
-    """Comando .bl <enlace> para descargar el video y subirlo al chat."""
-    await ctx.reply("⏳ ya estoy descargando el video... no te preocupes...❤️❤️❤️")
 
-    ydl_opts = {
-        'format': 'best[height<=360]/best',
-        'outtmpl': '%(id)s.%(ext)s',
-        'max_filesize': 8 * 1024 * 1024,
-        'noplaylist': True,
-    }
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Salta cada vez que alguien reacciona (on_message nunca ve las reacciones)."""
+    if payload.user_id == bot.user.id:
+        return
 
-    filename = None
+    now = time.time()
+    entry = reaction_counts.get(payload.message_id)
+    if not entry or now - entry['t'] > 3600:
+        entry = {'n': 0, 't': now, 'done': False}
+    entry['n'] += 1
+    entry['t'] = now
+    reaction_counts[payload.message_id] = entry
+
+    if len(reaction_counts) > 500:  # limpieza de memoria
+        for mid in [m for m, e in reaction_counts.items() if now - e['t'] > 3600]:
+            del reaction_counts[mid]
+
+    if entry['done'] or entry['n'] < REACTION_THRESHOLD:
+        return
+    if now - last_reaction_spoke.get(payload.channel_id, 0) < REACTION_COOLDOWN:
+        return
+
     try:
-        os.makedirs('downloads', exist_ok=True)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
 
-        if filename and os.path.exists(filename):
-            file_size = os.path.getsize(filename)
-            
-            if file_size > ctx.guild.filesize_limit:
-                await ctx.reply("❌ el video es muy pesado, no creo poder subirlo. lo siento.")
+    if msg.author.bot:
+        return
+    if not (msg.attachments or msg.embeds or URL_RE.search(msg.content)):
+        return
+
+    entry['done'] = True
+    last_reaction_spoke[payload.channel_id] = now
+    await msg.reply(await respuesta_ia(
+        "A un mensaje con un link o archivo le pusieron muchas reacciones. "
+        "Pregunta con curiosidad qué tendrá de especial.", "reaccion"), mention_author=False)
+
+
+# ───────────────────────────── Descargas ──────────────────────────────────────
+def limpiar_error(e: Exception) -> str:
+    texto = re.sub(r'\x1b\[[0-9;]*m', '', str(e))  # quita colores ANSI
+    return texto.strip()[:300]
+
+
+def _opciones_ydl(workdir: str) -> dict:
+    opts = {
+        # Hasta 720p, prefiere H.264/AAC para no tener que recomprimir
+        'format': 'bv*[height<=720]+ba/b[height<=720]/b',
+        'format_sort': ['res:720', 'vcodec:h264', 'acodec:aac'],
+        'merge_output_format': 'mp4',
+        'outtmpl': os.path.join(workdir, '%(id).50s.%(ext)s'),
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 20,
+        'retries': 3,
+        'restrictfilenames': True,
+        'max_filesize': 400 * 1024 * 1024,  # protege el disco de Render
+        'ffmpeg_location': FFMPEG,
+    }
+    cookies = os.environ.get('COOKIES_FILE')
+    if cookies and os.path.exists(cookies):
+        opts['cookiefile'] = cookies
+    return opts
+
+
+def _probar(url: str, workdir: str):
+    with yt_dlp.YoutubeDL({**_opciones_ydl(workdir), 'skip_download': True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if 'entries' in info:
+            info = next(iter(info['entries']))
+        return info.get('duration')
+
+
+def _descargar(url: str, workdir: str) -> str:
+    with yt_dlp.YoutubeDL(_opciones_ydl(workdir)) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if 'entries' in info:
+            info = next(iter(info['entries']))
+        rd = info.get('requested_downloads') or []
+        path = rd[0].get('filepath') if rd else None
+        return path or ydl.prepare_filename(info)
+
+
+async def duracion_ffmpeg(path: str):
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG, '-i', path, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', err.decode(errors='ignore'))
+    if not m:
+        return None
+    h, mi, s = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + float(s)
+
+
+class DemasiadoLargo(Exception):
+    pass
+
+
+async def comprimir(src: str, dst: str, duracion: float, limite: int) -> None:
+    """Recomprime con ffmpeg al bitrate justo para que quepa en `limite` bytes."""
+    video_k = int(limite * SAFETY * 8 / duracion / 1000) - AUDIO_KBPS
+
+    for _ in range(3):
+        if video_k < 100:
+            raise DemasiadoLargo()
+        alto = 720 if video_k >= 1400 else 480 if video_k >= 700 else 360 if video_k >= 350 else 240
+        cmd = [
+            FFMPEG, '-y', '-i', src,
+            '-vf', f'scale=-2:min(ih\\,{alto})',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+            '-b:v', f'{video_k}k', '-maxrate', f'{int(video_k * 1.3)}k', '-bufsize', f'{video_k * 2}k',
+            '-c:a', 'aac', '-b:a', f'{AUDIO_KBPS}k', '-ac', '2',
+            '-movflags', '+faststart', '-threads', '2', dst,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=900)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("la compresión tardó demasiado")
+        if proc.returncode != 0 or not os.path.exists(dst):
+            raise RuntimeError("ffmpeg falló al comprimir")
+
+        tam = os.path.getsize(dst)
+        if tam <= limite * 0.98:
+            return
+        video_k = int(video_k * (limite * SAFETY) / tam)  # quedó grande: reintentar más bajo
+    raise DemasiadoLargo()
+
+
+def limite_subida(ctx: commands.Context) -> int:
+    env = os.environ.get('MAX_UPLOAD_MB')
+    if env:
+        return int(float(env) * 1024 * 1024)
+    if ctx.guild:
+        return ctx.guild.filesize_limit
+    return 10 * 1024 * 1024
+
+
+@bot.command(name='bl')
+async def descargar_video(ctx: commands.Context, url: str = None):
+    """Comando .bl <enlace> para descargar el video y subirlo al chat."""
+    if not url:
+        await ctx.reply("pásame un link, cariño: `.bl <enlace>` 🙃")
+        return
+    url = url.strip('<>')
+
+    aviso = await ctx.reply("⏳ ya estoy descargando el video... no te preocupes...❤️❤️❤️")
+    limite = limite_subida(ctx)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    workdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
+
+    try:
+        async with descargas:
+            duracion = await asyncio.to_thread(_probar, url, workdir)
+            if duracion and duracion > MAX_DURATION:
+                await ctx.reply(f"❌ ese video dura {int(duracion // 60)} min y mi límite es "
+                                f"{MAX_DURATION // 60} min. lo siento...")
+                return
+
+            path = await asyncio.to_thread(_descargar, url, workdir)
+            if not path or not os.path.exists(path):
+                await ctx.reply("❌ No pude procesar el enlace... no se porque!!!.")
+                return
+
+            final = path
+            if os.path.getsize(path) > limite * 0.98:
+                duracion = duracion or await duracion_ffmpeg(path)
+                if not duracion:
+                    await ctx.reply("❌ no pude saber cuánto dura el video para comprimirlo.")
+                    return
+                await aviso.edit(content="🗜️ está pesado, lo estoy comprimiendo para que quepa...")
+                final = os.path.join(workdir, 'comprimido.mp4')
+                await comprimir(path, final, duracion, limite)
+
+        try:
+            await ctx.reply(file=discord.File(final, filename='video.mp4'))
+        except discord.HTTPException as e:
+            if e.status == 413:
+                await ctx.reply("❌ Discord no me dejó subirlo, sigue siendo muy pesado.")
             else:
-                await ctx.reply(file=discord.File(filename))
-            
-            os.remove(filename)
-        else:
-            await ctx.reply("❌ No pude procesar el enlace... no se porque!!!.")
+                raise
 
+    except DemasiadoLargo:
+        await ctx.reply(f"❌ el video es muy largo para el límite de {limite // (1024 * 1024)} MB "
+                        "sin dejarlo ilegible. prueba con uno más corto.")
     except Exception as e:
-        await ctx.reply(f"⚠️ algo malo paso al procesar el link, no se ques cariño!!!...: `{str(e)}`")
-        if filename and os.path.exists(filename):
-            os.remove(filename)
+        await ctx.reply(f"⚠️ algo malo paso al procesar el link, no se ques cariño!!!...: `{limpiar_error(e)}`")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
-bot.run(os.environ.get('DISCORD_TOKEN'))
+
+if __name__ == '__main__':
+    keep_alive()
+    token = os.environ.get('DISCORD_TOKEN')
+    if not token:
+        raise SystemExit("Falta la variable de entorno DISCORD_TOKEN")
+    bot.run(token)
+
