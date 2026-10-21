@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import random
 import re
@@ -7,7 +8,6 @@ import tempfile
 import time
 import unicodedata
 from collections import deque
-from pathlib import Path
 from threading import Thread
 
 import aiohttp
@@ -38,13 +38,16 @@ FFMPEG = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = 'downloads'
 
 MAX_DURATION = int(os.environ.get('MAX_DURATION', 600))   # segundos (10 min por defecto)
-AUDIO_KBPS = 64
+AUDIO_KBPS = 48
+TARGET_KBPS = 380      # bitrate total (video+audio) mínimo para que se vea decente en 360p
+MAX_PARTS = int(os.environ.get('MAX_PARTS', 4))  # máx. de partes si el video es largo
 SAFETY = 0.93                                             # margen para no pasarse del límite
 
 MENCIONES_NECESARIAS = 5
 RESET_SECONDS = 1800          # 30 min sin menciones de la categoría = contador a 0
 REACTION_THRESHOLD = 3        # reacciones para que el bot comente
 REACTION_COOLDOWN = 1800      # 30 min entre comentarios de reacciones por canal
+CHILE_COOLDOWN = int(os.environ.get('CHILE_COOLDOWN', 600))  # 10 min entre burlas por canal
 
 # IA (opcional). Prioridad: OpenRouter > Gemini > frases fijas.
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
@@ -76,7 +79,16 @@ TRIGGER_WORDS = {
 # Categorías que solo cuentan si el mensaje trae foto/video/link
 SOLO_CON_MEDIA = {"adulto", "follar"}
 
+# Jerga chilena que hace que Yumi se burle (solo si alguien escribe así)
+CHILE_WORDS = ["cachai", "cachay", "weon", "weona", "weones", "huevon", "huevona", "po", "sipo", "nopo",
+               "yapo", "altiro", "al tiro", "bacan", "fome", "pololo", "polola", "carrete", "carretear",
+               "la raja", "cuatico", "flaite", "guata", "ctm", "conchetumare", "aweonao", "aweonaos",
+               "pucha", "harto", "cabro", "cabra chica", "luca", "lucas", "palta", "once"]
+CHILE_FUERTES = [w for w in CHILE_WORDS if w not in ("harto", "luca", "lucas", "palta", "once", "pucha")]
+
 FALLBACKS = {
+    "chile": ["jajaja ¿'cachai'?... ay no, qué cantadito hablas, criaturita 😏",
+              "¿'po'? ¿me estás hablando en chileno?... 🤭 ya po, cariño, no te entiendo ni la mitad 😂"],
     "media": ["otra foto raruna o… ¿por fin dejaron de mandar porno, chicos?... 😅😅😅",
               "chicos… ¿otra vez con eso?... 😅😅😅"],
     "texto": ["emmm… ¿okey? ¿de qué están hablando?... 🤨🤨🤨",
@@ -99,6 +111,14 @@ PATTERNS = {
     cat: re.compile(r'\b(?:' + '|'.join(re.escape(normalizar(p)) for p in words) + r')\b')
     for cat, words in TRIGGER_WORDS.items()
 }
+
+
+CHILE_RE = re.compile(r'\b(?:' + '|'.join(re.escape(normalizar(p)) for p in CHILE_FUERTES) + r')\b')
+
+
+def habla_chileno(contenido: str) -> bool:
+    limpio = normalizar(URL_RE.sub(' ', contenido))
+    return len(CHILE_RE.findall(limpio)) >= 1
 
 
 def detectar_categoria(contenido: str):
@@ -193,7 +213,7 @@ intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 keyword_data = {}        # {categoria: {'count': int, 'last_time': float}}
-historial = {}           # {channel_id: deque con los últimos mensajes}
+last_chile = {}          # {channel_id: float}
 reaction_counts = {}     # {message_id: {'n': int, 't': float, 'done': bool}}
 last_reaction_spoke = {}  # {channel_id: float}
 last_chat = {}           # {user_id: float}  (anti-spam de la charla con IA)
@@ -225,8 +245,7 @@ async def on_message(message: discord.Message):
 
     # Memoria corta del canal para que Yumi entienda de qué se habla
     if message.content and not message.content.startswith(PREFIX):
-        historial.setdefault(message.channel.id, deque(maxlen=8)).append(
-            f"{message.author.display_name}: {message.content[:200]}")
+        recordar(message.channel.id, message.author.display_name, message.content)
 
     # 1. Palabras clave con contador por categoría
     cat = detectar_categoria(message.content)
@@ -255,6 +274,18 @@ async def on_message(message: discord.Message):
             situacion = f"[{message.author.display_name} te habla directamente]: {texto or '(te mencionó sin decir nada)'}"
             async with message.channel.typing():
                 resp = await respuesta_ia(situacion, "texto", message.channel.id)
+            await message.reply(resp, mention_author=False)
+            recordar(message.channel.id, "Yumi", resp)
+
+    # 3. Burla cariñosa SOLO cuando alguien escribe con jerga chilena
+    elif not message.content.startswith(PREFIX) and habla_chileno(message.content):
+        if now - last_chile.get(message.channel.id, 0) > CHILE_COOLDOWN:
+            last_chile[message.channel.id] = now
+            situacion = (f"[Situación: {message.author.display_name} escribió con jerga chilena: "
+                         f"\"{message.content[:200]}\". Búrlate con cariño de cómo habla, citando y exagerando "
+                         f"sus palabras chilenas. Tú NO hablas chileno.]")
+            async with message.channel.typing():
+                resp = await respuesta_ia(situacion, "chile", message.channel.id)
             await message.reply(resp, mention_author=False)
             recordar(message.channel.id, "Yumi", resp)
 
@@ -308,11 +339,11 @@ def limpiar_error(e: Exception) -> str:
     return texto.strip()[:300]
 
 
-def _opciones_ydl(workdir: str) -> dict:
+def _opciones_ydl(workdir: str, altura: int = 720) -> dict:
     opts = {
-        # Hasta 720p, prefiere H.264/AAC para no tener que recomprimir
-        'format': 'bv*[height<=720]+ba/b[height<=720]/b',
-        'format_sort': ['res:720', 'vcodec:h264', 'acodec:aac'],
+        # Baja solo la calidad que hace falta (más rápido y liviano); prefiere H.264/AAC
+        'format': f'bv*[height<={altura}]+ba/b[height<={altura}]/b',
+        'format_sort': [f'res:{altura}', 'vcodec:h264', 'acodec:aac'],
         'merge_output_format': 'mp4',
         'outtmpl': os.path.join(workdir, '%(id).50s.%(ext)s'),
         'noplaylist': True,
@@ -338,8 +369,8 @@ def _probar(url: str, workdir: str):
         return info.get('duration')
 
 
-def _descargar(url: str, workdir: str) -> str:
-    with yt_dlp.YoutubeDL(_opciones_ydl(workdir)) as ydl:
+def _descargar(url: str, workdir: str, altura: int = 720) -> str:
+    with yt_dlp.YoutubeDL(_opciones_ydl(workdir, altura)) as ydl:
         info = ydl.extract_info(url, download=True)
         if 'entries' in info:
             info = next(iter(info['entries']))
@@ -363,16 +394,31 @@ class DemasiadoLargo(Exception):
     pass
 
 
-async def comprimir(src: str, dst: str, duracion: float, limite: int) -> None:
-    """Recomprime con ffmpeg al bitrate justo para que quepa en `limite` bytes."""
+def alto_para(video_k: float) -> int:
+    return 720 if video_k >= 1400 else 480 if video_k >= 700 else 360 if video_k >= 250 else 240
+
+
+def plan(duracion: float, limite: int):
+    """Devuelve (partes, alto). Si el video no cabe en ~360p decente, se parte en varios trozos."""
+    por_parte = limite * SAFETY * 8 / (TARGET_KBPS * 1000)   # segundos que caben a ~360p
+    n = max(1, math.ceil(duracion / por_parte))
+    largo = duracion / n
+    video_k = limite * SAFETY * 8 / largo / 1000 - AUDIO_KBPS
+    return n, alto_para(video_k)
+
+
+async def comprimir(src: str, dst: str, duracion: float, limite: int, inicio=None) -> None:
+    """Recomprime con ffmpeg al bitrate justo para que `duracion` segundos quepan en `limite` bytes.
+    Si `inicio` no es None, recorta ese tramo (inicio, inicio+duracion)."""
     video_k = int(limite * SAFETY * 8 / duracion / 1000) - AUDIO_KBPS
 
     for _ in range(3):
         if video_k < 120:
             raise DemasiadoLargo()
-        alto = 720 if video_k >= 1400 else 480 if video_k >= 700 else 360 if video_k >= 250 else 240
+        alto = alto_para(video_k)
+        corte = ['-ss', f'{inicio:.2f}'] if inicio is not None else []
         cmd = [
-            FFMPEG, '-y', '-i', src,
+            FFMPEG, '-y', *corte, '-i', src, *(['-t', f'{duracion:.2f}'] if inicio is not None else []),
             '-vf', f'scale=-2:min(ih\\,{alto})',
             '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
             '-b:v', f'{video_k}k', '-maxrate', f'{int(video_k * 1.3)}k', '-bufsize', f'{video_k * 2}k',
@@ -405,6 +451,16 @@ def limite_subida(ctx: commands.Context) -> int:
     return 10 * 1024 * 1024
 
 
+async def subir(ctx: commands.Context, path: str, texto=None):
+    try:
+        await ctx.reply(texto, file=discord.File(path, filename='video.mp4'))
+    except discord.HTTPException as e:
+        if e.status == 413:
+            await ctx.reply("❌ Discord no me dejó subirlo, sigue siendo muy pesado.")
+        else:
+            raise
+
+
 @bot.command(name='bl')
 async def descargar_video(ctx: commands.Context, url: str = None):
     """Comando .bl <enlace> para descargar el video y subirlo al chat."""
@@ -426,28 +482,44 @@ async def descargar_video(ctx: commands.Context, url: str = None):
                                 f"{MAX_DURATION // 60} min. lo siento...")
                 return
 
-            path = await asyncio.to_thread(_descargar, url, workdir)
+            altura = plan(duracion, limite)[1] if duracion else 720
+            path = await asyncio.to_thread(_descargar, url, workdir, altura)
             if not path or not os.path.exists(path):
                 await ctx.reply("❌ No pude procesar el enlace... no se porque!!!.")
                 return
 
-            final = path
-            if os.path.getsize(path) > limite * 0.98:
-                duracion = duracion or await duracion_ffmpeg(path)
-                if not duracion:
-                    await ctx.reply("❌ no pude saber cuánto dura el video para comprimirlo.")
-                    return
+            # ¿Ya cabe tal cual? Se manda sin recomprimir.
+            if os.path.getsize(path) <= limite * 0.98:
+                await subir(ctx, path)
+                return
+
+            duracion = duracion or await duracion_ffmpeg(path)
+            if not duracion:
+                await ctx.reply("❌ no pude saber cuánto dura el video para comprimirlo.")
+                return
+            if duracion > MAX_DURATION:
+                await ctx.reply(f"❌ ese video dura {int(duracion // 60)} min y mi límite es "
+                                f"{MAX_DURATION // 60} min. lo siento...")
+                return
+
+            partes, _ = plan(duracion, limite)
+            if partes > MAX_PARTS:
+                raise DemasiadoLargo()
+
+            if partes == 1:
                 await aviso.edit(content="🗜️ está pesado, lo estoy comprimiendo para que quepa...")
                 final = os.path.join(workdir, 'comprimido.mp4')
                 await comprimir(path, final, duracion, limite)
-
-        try:
-            await ctx.reply(file=discord.File(final, filename='video.mp4'))
-        except discord.HTTPException as e:
-            if e.status == 413:
-                await ctx.reply("❌ Discord no me dejó subirlo, sigue siendo muy pesado.")
+                await subir(ctx, final)
             else:
-                raise
+                largo = duracion / partes
+                for i in range(partes):
+                    await aviso.edit(content=f"🗜️ es largo, lo parto en {partes} partes para mantener la "
+                                             f"calidad... parte {i + 1}/{partes} ⏳")
+                    final = os.path.join(workdir, f'parte{i + 1}.mp4')
+                    await comprimir(path, final, largo, limite, inicio=i * largo)
+                    await subir(ctx, final, f"📼 parte {i + 1}/{partes}")
+                    os.remove(final)
 
     except DemasiadoLargo:
         await ctx.reply(f"❌ el video es muy largo para el límite de {limite // (1024 * 1024)} MB "
@@ -464,5 +536,3 @@ if __name__ == '__main__':
     if not token:
         raise SystemExit("Falta la variable de entorno DISCORD_TOKEN")
     bot.run(token)
-
-
