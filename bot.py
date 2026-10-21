@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import time
 import unicodedata
+from collections import deque
+from pathlib import Path
 from threading import Thread
 
 import aiohttp
@@ -44,16 +46,25 @@ RESET_SECONDS = 1800          # 30 min sin menciones de la categoría = contador
 REACTION_THRESHOLD = 3        # reacciones para que el bot comente
 REACTION_COOLDOWN = 1800      # 30 min entre comentarios de reacciones por canal
 
-# IA opcional (Gemini gratis). Si no hay GEMINI_API_KEY se usan frases fijas.
+# IA (opcional). Prioridad: OpenRouter > Gemini > frases fijas.
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
+HISTORY_SIZE = 8  # últimos mensajes del canal que la IA "recuerda"
 
-PERSONALIDAD = (
-    "Eres un bot de Discord con personalidad juguetona, cariñosa y un poquito sarcástica. "
-    "Hablas en español casual, con 1 o 2 frases cortas y un par de emojis. "
-    "Nunca das sermones ni regaños; te haces el curioso o el chistoso. "
-    "No repitas tu frase de siempre, varía."
-)
+PERSONALIDAD_DEFAULT = "Eres Yumi, una bot de Discord curiosa, juguetona y burlona."
+
+
+def cargar_personalidad() -> str:
+    try:
+        with open('personalidad.txt', encoding='utf-8') as f:
+            return f.read().strip() or PERSONALIDAD_DEFAULT
+    except FileNotFoundError:
+        return PERSONALIDAD_DEFAULT
+
+
+PERSONALIDAD = cargar_personalidad()
 
 TRIGGER_WORDS = {
     "adulto": ["porno", "sexo", "hentai", "nudes", "pack", "nsfw", "rule34", "paja", "pajas", "pajero"],
@@ -99,36 +110,79 @@ def detectar_categoria(contenido: str):
 
 
 _session = None
+history = {}  # {channel_id: deque([(autor, texto), ...])}
+IA_ACTIVA = bool(OPENROUTER_API_KEY or GEMINI_API_KEY)
 
 
 async def get_session():
     global _session
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
     return _session
 
 
-async def respuesta_ia(situacion: str, fallback_key: str) -> str:
-    """Genera una frase con Gemini; si falla o no hay clave, usa una frase fija."""
+def recordar(channel_id: int, autor: str, texto: str):
+    texto = URL_RE.sub('[link]', texto).strip()
+    if texto:
+        history.setdefault(channel_id, deque(maxlen=HISTORY_SIZE)).append((autor, texto[:300]))
+
+
+def contexto(channel_id) -> str:
+    h = history.get(channel_id)
+    if not h:
+        return ""
+    return "Últimos mensajes del chat:\n" + "\n".join(f"{a}: {t}" for a, t in h) + "\n\n"
+
+
+async def _openrouter(prompt: str) -> str:
+    session = await get_session()
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "system", "content": PERSONALIDAD},
+                     {"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 1.0,
+    }
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+    async with session.post("https://openrouter.ai/api/v1/chat/completions",
+                            json=body, headers=headers) as r:
+        if r.status != 200:
+            raise RuntimeError(f"openrouter {r.status}")
+        data = await r.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+async def _gemini(prompt: str) -> str:
+    session = await get_session()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body = {
+        "systemInstruction": {"parts": [{"text": PERSONALIDAD}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 1.0},
+    }
+    async with session.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}) as r:
+        if r.status != 200:
+            raise RuntimeError(f"gemini {r.status}")
+        data = await r.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+async def respuesta_ia(situacion: str, fallback_key: str, channel_id=None) -> str:
+    """Genera la respuesta con la IA; si falla o no hay clave, usa una frase fija."""
     fallback = random.choice(FALLBACKS[fallback_key])
-    if not GEMINI_API_KEY:
+    if not IA_ACTIVA:
         return fallback
-    try:
-        session = await get_session()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-        body = {
-            "systemInstruction": {"parts": [{"text": PERSONALIDAD}]},
-            "contents": [{"role": "user", "parts": [{"text": situacion}]}],
-            "generationConfig": {"maxOutputTokens": 120, "temperature": 1.0},
-        }
-        async with session.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}) as r:
-            if r.status != 200:
-                return fallback
-            data = await r.json()
-        texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return texto[:400] or fallback
-    except Exception:
-        return fallback
+    prompt = (contexto(channel_id) if channel_id else "") + situacion
+    for motor, activo in ((_openrouter, OPENROUTER_API_KEY), (_gemini, GEMINI_API_KEY)):
+        if not activo:
+            continue
+        try:
+            texto = await motor(prompt)
+            if texto:
+                return texto[:600]
+        except Exception as e:
+            print(f"IA falló ({motor.__name__}): {e}")
+    return fallback
 
 
 # ───────────────────────────── Bot ────────────────────────────────────────────
@@ -139,6 +193,7 @@ intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 keyword_data = {}        # {categoria: {'count': int, 'last_time': float}}
+historial = {}           # {channel_id: deque con los últimos mensajes}
 reaction_counts = {}     # {message_id: {'n': int, 't': float, 'done': bool}}
 last_reaction_spoke = {}  # {channel_id: float}
 last_chat = {}           # {user_id: float}  (anti-spam de la charla con IA)
@@ -147,7 +202,18 @@ descargas = asyncio.Semaphore(1)  # una descarga a la vez (Render gratis tiene p
 
 @bot.event
 async def on_ready():
-    print(f'¡Bot conectado con éxito como {bot.user}! IA: {"sí" if GEMINI_API_KEY else "no"}')
+    print(f'¡Bot conectado con éxito como {bot.user}! IA: {"OpenRouter" if OPENROUTER_API_KEY else "Gemini" if GEMINI_API_KEY else "no (frases fijas)"}')
+
+
+async def me_hablan(message: discord.Message) -> bool:
+    if bot.user in message.mentions:
+        return True
+    ref = message.reference
+    if ref and ref.message_id:
+        resuelto = ref.resolved
+        if isinstance(resuelto, discord.Message):
+            return resuelto.author == bot.user
+    return False
 
 
 @bot.event
@@ -156,6 +222,11 @@ async def on_message(message: discord.Message):
         return
 
     now = time.time()
+
+    # Memoria corta del canal para que Yumi entienda de qué se habla
+    if message.content and not message.content.startswith(PREFIX):
+        historial.setdefault(message.channel.id, deque(maxlen=8)).append(
+            f"{message.author.display_name}: {message.content[:200]}")
 
     # 1. Palabras clave con contador por categoría
     cat = detectar_categoria(message.content)
@@ -174,16 +245,18 @@ async def on_message(message: discord.Message):
                 clave = "media" if cat in SOLO_CON_MEDIA else "texto"
                 situacion = (f"En el chat llevan {MENCIONES_NECESARIAS} mensajes seguidos hablando de "
                              f"'{cat}'. Comenta algo corto y gracioso sobre eso.")
-                await message.reply(await respuesta_ia(situacion, clave), mention_author=False)
+                await message.reply(await respuesta_ia(situacion, clave, message.channel.id), mention_author=False)
 
-    # 2. Charla con IA si mencionan al bot (solo si hay API key)
-    elif GEMINI_API_KEY and bot.user in message.mentions and not message.content.startswith(PREFIX):
+    # 2. Charla con IA si mencionan al bot o le responden a un mensaje suyo
+    elif IA_ACTIVA and not message.content.startswith(PREFIX) and await me_hablan(message):
         if now - last_chat.get(message.author.id, 0) > 8:
             last_chat[message.author.id] = now
             texto = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+            situacion = f"[{message.author.display_name} te habla directamente]: {texto or '(te mencionó sin decir nada)'}"
             async with message.channel.typing():
-                resp = await respuesta_ia(f"Un usuario te dijo: {texto or '(te mencionó sin decir nada)'}", "texto")
+                resp = await respuesta_ia(situacion, "texto", message.channel.id)
             await message.reply(resp, mention_author=False)
+            recordar(message.channel.id, "Yumi", resp)
 
     await bot.process_commands(message)
 
@@ -226,7 +299,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     last_reaction_spoke[payload.channel_id] = now
     await msg.reply(await respuesta_ia(
         "A un mensaje con un link o archivo le pusieron muchas reacciones. "
-        "Pregunta con curiosidad qué tendrá de especial.", "reaccion"), mention_author=False)
+        "Pregunta con curiosidad qué tendrá de especial.", "reaccion", payload.channel_id), mention_author=False)
 
 
 # ───────────────────────────── Descargas ──────────────────────────────────────
@@ -295,9 +368,9 @@ async def comprimir(src: str, dst: str, duracion: float, limite: int) -> None:
     video_k = int(limite * SAFETY * 8 / duracion / 1000) - AUDIO_KBPS
 
     for _ in range(3):
-        if video_k < 100:
+        if video_k < 120:
             raise DemasiadoLargo()
-        alto = 720 if video_k >= 1400 else 480 if video_k >= 700 else 360 if video_k >= 350 else 240
+        alto = 720 if video_k >= 1400 else 480 if video_k >= 700 else 360 if video_k >= 250 else 240
         cmd = [
             FFMPEG, '-y', '-i', src,
             '-vf', f'scale=-2:min(ih\\,{alto})',
@@ -391,4 +464,5 @@ if __name__ == '__main__':
     if not token:
         raise SystemExit("Falta la variable de entorno DISCORD_TOKEN")
     bot.run(token)
+
 
